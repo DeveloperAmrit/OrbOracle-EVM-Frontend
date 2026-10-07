@@ -12,6 +12,9 @@ import { Label } from "@/components/ui/label"
 import { useOracle } from "@/hooks/useOracles"
 import { useToast } from "@/hooks/use-toast"
 import { OracleAbi } from "@/utils/abi/Oracle"
+import { ComposedOracleAbi } from "@/utils/abi/ComposedOracle"
+import { ComposedOracleFactoryAbi } from "@/utils/abi/ComposedOracleFactory"
+import { ComposedOracleFactories } from "@/utils/addresses"
 import {
   ArrowLeft,
   Clock,
@@ -36,9 +39,32 @@ function isHexAddress(value: string | null): value is `0x${string}` {
 
 type PriceHistoryResult = readonly [readonly bigint[], readonly bigint[], readonly bigint[]]
 
-const PRICE_DECIMALS = 8
+const PRICE_DECIMALS = 18
 const DISPLAY_PRECISION = 6
 const MAX_PRICE_POINTS = 20
+
+const compose = (
+  valA: bigint,
+  valB: bigint,
+  operation: number,
+  invertResult: boolean
+) => {
+  if (valB === BigInt(0)) return BigInt(0)
+  let result = BigInt(0)
+  const WAD = BigInt(1000000000000000000)
+
+  if (operation === 0) {
+    result = (valA * valB) / WAD
+  } else {
+    result = (valA * WAD) / valB
+  }
+
+  if (invertResult) {
+    if (result === BigInt(0)) return BigInt(0)
+    result = (WAD * WAD) / result
+  }
+  return result
+}
 
 const formatPriceFromWei = (value: bigint) => {
   const numeric = Number.parseFloat(formatUnits(value, PRICE_DECIMALS))
@@ -70,10 +96,13 @@ export default function OracleInteractionPage() {
   const [isUpdatingVoteWeights, setIsUpdatingVoteWeights] = useState(false)
   const [isReadingValue, setIsReadingValue] = useState(false)
   const [isReadingLatestValue, setIsReadingLatestValue] = useState(false)
+  const [isReadingInterval, setIsReadingInterval] = useState(false)
 
   // Real-time oracle data
   const [latestValue, setLatestValue] = useState<string>("—")
   const [aggregatedValue, setAggregatedValue] = useState<string>("—")
+  const [minValue, setMinValue] = useState<string>("—")
+  const [maxValue, setMaxValue] = useState<string>("—")
   const [lastUpdated, setLastUpdated] = useState<string>("Loading...")
   const [userDepositedTokens, setUserDepositedTokens] = useState<string>("0")
   const [userTokenBalance, setUserTokenBalance] = useState<string>("0")
@@ -138,6 +167,8 @@ export default function OracleInteractionPage() {
   const chainIdValid = chainId !== undefined && Number.isFinite(chainId) && chainId > 0
   const publicClient = usePublicClient({ chainId })
 
+  const { oracle, loading: oracleLoading, error: oracleError } = useOracle(oracleAddress || "", chainId)
+
   // Contract write hook
   const { writeContract, writeContractAsync, data: hash, error: contractError, isPending } = useWriteContract()
   const { isLoading: isConfirming, isSuccess: isConfirmed } = useWaitForTransactionReceipt({
@@ -149,21 +180,21 @@ export default function OracleInteractionPage() {
     address: oracleAddress || undefined,
     abi: OracleAbi,
     functionName: 'WEIGHT_TOKEN',
-    query: { enabled: !!oracleAddress }
+    query: { enabled: !!oracleAddress && !oracle?.isComposed }
   })
 
   const { data: weightTokenSymbolData } = useReadContract({
     address: (weightTokenAddress as `0x${string}`) || undefined,
     abi: erc20Abi,
     functionName: 'symbol',
-    query: { enabled: !!weightTokenAddress }
+    query: { enabled: !!weightTokenAddress && !oracle?.isComposed }
   })
 
   const { data: weightTokenDecimalsData } = useReadContract({
     address: (weightTokenAddress as `0x${string}`) || undefined,
     abi: erc20Abi,
     functionName: 'decimals',
-    query: { enabled: !!weightTokenAddress }
+    query: { enabled: !!weightTokenAddress && !oracle?.isComposed }
   })
 
   // Read user's locked tokens (for governance operations)
@@ -172,7 +203,7 @@ export default function OracleInteractionPage() {
     abi: OracleAbi,
     functionName: 'lockedTokens',
     args: userAddress ? [userAddress] : undefined,
-    query: { enabled: !!oracleAddress && !!userAddress }
+    query: { enabled: !!oracleAddress && !!userAddress && !oracle?.isComposed }
   })
 
   // Read user's unlocked tokens (available for withdrawal)
@@ -181,7 +212,7 @@ export default function OracleInteractionPage() {
     abi: OracleAbi,
     functionName: 'unlockedTokens',
     args: userAddress ? [userAddress] : undefined,
-    query: { enabled: !!oracleAddress && !!userAddress }
+    query: { enabled: !!oracleAddress && !!userAddress && !oracle?.isComposed }
   })
 
   // Read user's deposit timestamp
@@ -190,7 +221,7 @@ export default function OracleInteractionPage() {
     abi: OracleAbi,
     functionName: 'depositTimestamp',
     args: userAddress ? [userAddress] : undefined,
-    query: { enabled: !!oracleAddress && !!userAddress }
+    query: { enabled: !!oracleAddress && !!userAddress && !oracle?.isComposed }
   })
 
   // Read user's last operation timestamp
@@ -199,14 +230,14 @@ export default function OracleInteractionPage() {
     abi: OracleAbi,
     functionName: 'lastOperationTimestamp',
     args: userAddress ? [userAddress] : undefined,
-    query: { enabled: !!oracleAddress && !!userAddress }
+    query: { enabled: !!oracleAddress && !!userAddress && !oracle?.isComposed }
   })
 
-  const { data: lastSubmissionTimeData } = useReadContract({
+  const { data: lastUpdatedData } = useReadContract({
     address: oracleAddress || undefined,
     abi: OracleAbi,
-    functionName: 'lastSubmissionTime',
-    query: { enabled: !!oracleAddress }
+    functionName: 'lastUpdated',
+    query: { enabled: !!oracleAddress && !oracle?.isComposed }
   })
 
   // Read oracle configuration parameters
@@ -214,54 +245,50 @@ export default function OracleInteractionPage() {
     address: oracleAddress || undefined,
     abi: OracleAbi,
     functionName: 'REWARD_BPS',
-    query: { enabled: !!oracleAddress }
+    query: { enabled: !!oracleAddress && !oracle?.isComposed }
   })
 
   const { data: halfLifeSecondsData } = useReadContract({
     address: oracleAddress || undefined,
     abi: OracleAbi,
     functionName: 'HALF_LIFE_SECONDS',
-    query: { enabled: !!oracleAddress }
+    query: { enabled: !!oracleAddress && !oracle?.isComposed }
   })
 
   const { data: quorumData } = useReadContract({
     address: oracleAddress || undefined,
     abi: OracleAbi,
     functionName: 'Q',
-    query: { enabled: !!oracleAddress }
+    query: { enabled: !!oracleAddress && !oracle?.isComposed }
   })
 
   const { data: operationLockingPeriodData } = useReadContract({
     address: oracleAddress || undefined,
     abi: OracleAbi,
     functionName: 'DEPOSIT_LOCKING_PERIOD',
-    query: { enabled: !!oracleAddress }
+    query: { enabled: !!oracleAddress && !oracle?.isComposed }
   })
 
   const { data: withdrawalLockingPeriodData } = useReadContract({
     address: oracleAddress || undefined,
     abi: OracleAbi,
     functionName: 'WITHDRAWAL_LOCKING_PERIOD',
-    query: { enabled: !!oracleAddress }
+    query: { enabled: !!oracleAddress && !oracle?.isComposed }
   })
 
   const { data: alphaData } = useReadContract({
     address: oracleAddress || undefined,
     abi: OracleAbi,
     functionName: 'GAMMA',
-    query: { enabled: !!oracleAddress }
+    query: { enabled: !!oracleAddress && !oracle?.isComposed }
   })
-
-  // Read current oracle values for display (using view functions or public variables)
-  // Note: Since readValue/readLatestValue are not view functions, we need to find the storage variables
-  // Let's try to read from events or use a different approach
 
   // Read the latest price history to get current values
   const { data: priceHistoryLengthData } = useReadContract({
     address: oracleAddress || undefined,
     abi: OracleAbi,
     functionName: 'getPriceHistoryLength',
-    query: { enabled: !!oracleAddress }
+    query: { enabled: !!oracleAddress && !oracle?.isComposed }
   })
 
   const priceHistoryRangeArgs = useMemo(() => {
@@ -288,19 +315,158 @@ export default function OracleInteractionPage() {
     functionName: 'getPriceHistoryRange',
     args: priceHistoryRangeArgs,
     query: { 
-      enabled: !!oracleAddress && !!priceHistoryRangeArgs
+      enabled: !!oracleAddress && !!priceHistoryRangeArgs && !oracle?.isComposed
     }
   })
 
+  // Read lookback interval (min and max values)
+  const { data: valueIntervalData, refetch: refetchValueInterval } = useReadContract({
+    address: oracleAddress || undefined,
+    abi: (oracle?.isComposed ? ComposedOracleAbi : OracleAbi) as any,
+    functionName: 'readValueInterval',
+    query: { enabled: !!oracleAddress }
+  })
+
+  // Parent feed A reads
+  const { data: priceHistoryLengthA } = useReadContract({
+    address: (oracle?.feedA as `0x${string}`) || undefined,
+    abi: OracleAbi,
+    functionName: 'getPriceHistoryLength',
+    query: { enabled: !!oracle?.isComposed && !!oracle?.feedA }
+  })
+
+  const priceHistoryRangeArgsA = useMemo(() => {
+    if (!priceHistoryLengthA) return undefined
+    const length = priceHistoryLengthA as bigint
+    const zero = BigInt(0)
+    if (length === zero) return undefined
+    const end = length
+    const maxPoints = BigInt(MAX_PRICE_POINTS)
+    const start = length > maxPoints ? length - maxPoints : zero
+    return [start, end] as const
+  }, [priceHistoryLengthA])
+
+  const { data: latestPriceHistoryDataA, isFetching: isFetchingHistoryA } = useReadContract({
+    address: (oracle?.feedA as `0x${string}`) || undefined,
+    abi: OracleAbi,
+    functionName: 'getPriceHistoryRange',
+    args: priceHistoryRangeArgsA,
+    query: { enabled: !!oracle?.isComposed && !!oracle?.feedA && !!priceHistoryRangeArgsA }
+  })
+
+  // Parent feed B reads
+  const { data: priceHistoryLengthB } = useReadContract({
+    address: (oracle?.feedB as `0x${string}`) || undefined,
+    abi: OracleAbi,
+    functionName: 'getPriceHistoryLength',
+    query: { enabled: !!oracle?.isComposed && !!oracle?.feedB }
+  })
+
+  const priceHistoryRangeArgsB = useMemo(() => {
+    if (!priceHistoryLengthB) return undefined
+    const length = priceHistoryLengthB as bigint
+    const zero = BigInt(0)
+    if (length === zero) return undefined
+    const end = length
+    const maxPoints = BigInt(MAX_PRICE_POINTS)
+    const start = length > maxPoints ? length - maxPoints : zero
+    return [start, end] as const
+  }, [priceHistoryLengthB])
+
+  const { data: latestPriceHistoryDataB, isFetching: isFetchingHistoryB } = useReadContract({
+    address: (oracle?.feedB as `0x${string}`) || undefined,
+    abi: OracleAbi,
+    functionName: 'getPriceHistoryRange',
+    args: priceHistoryRangeArgsB,
+    query: { enabled: !!oracle?.isComposed && !!oracle?.feedB && !!priceHistoryRangeArgsB }
+  })
+
   useEffect(() => {
-    if (!latestPriceHistoryData) {
-      setPriceHistoryPoints([])
+    if (!latestPriceHistoryData || oracle?.isComposed) {
       return
     }
 
     const history = buildPriceHistoryPoints(latestPriceHistoryData as PriceHistoryResult)
     setPriceHistoryPoints(history)
-  }, [latestPriceHistoryData, buildPriceHistoryPoints])
+  }, [latestPriceHistoryData, buildPriceHistoryPoints, oracle?.isComposed])
+
+  // Aligned price history calculation for Composed Oracles
+  useEffect(() => {
+    if (!oracle?.isComposed || !latestPriceHistoryDataA || !latestPriceHistoryDataB) {
+      return
+    }
+
+    const [timestampsA, aggregatedA, latestA] = latestPriceHistoryDataA as PriceHistoryResult
+    const [timestampsB, aggregatedB, latestB] = latestPriceHistoryDataB as PriceHistoryResult
+
+    const alignedPoints: PriceChartPoint[] = []
+
+    const op = oracle.operation ?? 0
+    const inv = oracle.invertResult ?? false
+
+    // Merge unique timestamps and sort them ascending
+    const allTimestamps = Array.from(
+      new Set([
+        ...timestampsA.map((t) => Number(t)),
+        ...timestampsB.map((t) => Number(t)),
+      ])
+    ).sort((a, b) => a - b)
+
+    let lastAggA = BigInt(0)
+    let lastAggB = BigInt(0)
+    let lastLatA = BigInt(0)
+    let lastLatB = BigInt(0)
+
+    if (aggregatedA.length > 0) lastAggA = aggregatedA[0]
+    if (aggregatedB.length > 0) lastAggB = aggregatedB[0]
+    if (latestA.length > 0) lastLatA = latestA[0]
+    if (latestB.length > 0) lastLatB = latestB[0]
+
+    allTimestamps.forEach((ts) => {
+      const idxA = timestampsA.findIndex((t) => Number(t) === ts)
+      if (idxA !== -1) {
+        lastAggA = aggregatedA[idxA]
+        lastLatA = latestA[idxA]
+      } else {
+        const prevIdx = timestampsA.map((t) => Number(t)).reduce((prev, curr, idx) => (curr < ts ? idx : prev), -1)
+        if (prevIdx !== -1) {
+          lastAggA = aggregatedA[prevIdx]
+          lastLatA = latestA[prevIdx]
+        }
+      }
+
+      const idxB = timestampsB.findIndex((t) => Number(t) === ts)
+      if (idxB !== -1) {
+        lastAggB = aggregatedB[idxB]
+        lastLatB = latestB[idxB]
+      } else {
+        const prevIdx = timestampsB.map((t) => Number(t)).reduce((prev, curr, idx) => (curr < ts ? idx : prev), -1)
+        if (prevIdx !== -1) {
+          lastAggB = aggregatedB[prevIdx]
+          lastLatB = latestB[prevIdx]
+        }
+      }
+
+      const composedAgg = compose(lastAggA, lastAggB, op, inv)
+      const composedLat = compose(lastLatA, lastLatB, op, inv)
+
+      alignedPoints.push({
+        timestamp: ts,
+        aggregated: Number(formatUnits(composedAgg, PRICE_DECIMALS)) || 0,
+        latest: Number(formatUnits(composedLat, PRICE_DECIMALS)) || 0,
+      })
+    })
+
+    const finalPoints = alignedPoints.slice(-MAX_PRICE_POINTS)
+    setPriceHistoryPoints(finalPoints)
+
+    if (finalPoints.length > 0) {
+      const latestPoint = finalPoints[finalPoints.length - 1]
+      setAggregatedValue(latestPoint.aggregated.toFixed(DISPLAY_PRECISION))
+      setLatestValue(latestPoint.latest.toFixed(DISPLAY_PRECISION))
+      setLastUpdated("Just now")
+    }
+  }, [oracle, latestPriceHistoryDataA, latestPriceHistoryDataB])
 
   // Token balance and allowance
   const { data: userTokenBalanceData } = useReadContract({
@@ -380,8 +546,8 @@ export default function OracleInteractionPage() {
     if (tokenAllowanceData !== undefined) {
       setTokenAllowance(formatTokenAmount(tokenAllowanceData as bigint, 4))
     }
-    if (lastSubmissionTimeData) {
-      const timestamp = Number(lastSubmissionTimeData as bigint)
+    if (lastUpdatedData) {
+      const timestamp = Number(lastUpdatedData as bigint)
       const now = Math.floor(Date.now() / 1000)
       const diff = now - timestamp
       if (diff < 60) {
@@ -439,7 +605,14 @@ export default function OracleInteractionPage() {
       }
     }
 
-  }, [lockedTokensData, unlockedTokensData, userTokenBalanceData, tokenAllowanceData, formatTokenAmount, weightTokenDecimals, lastSubmissionTimeData, rewardData, halfLifeSecondsData, quorumData, operationLockingPeriodData, withdrawalLockingPeriodData, alphaData, depositTimestampData, lastOperationTimestampData])
+    // Update interval lookback values
+    if (valueIntervalData && Array.isArray(valueIntervalData) && valueIntervalData.length === 2) {
+      const [minRaw, maxRaw] = valueIntervalData as [bigint, bigint]
+      setMinValue(formatPriceFromWei(minRaw))
+      setMaxValue(formatPriceFromWei(maxRaw))
+    }
+
+  }, [lockedTokensData, unlockedTokensData, userTokenBalanceData, tokenAllowanceData, formatTokenAmount, weightTokenDecimals, lastUpdatedData, rewardData, halfLifeSecondsData, quorumData, operationLockingPeriodData, withdrawalLockingPeriodData, alphaData, depositTimestampData, lastOperationTimestampData, valueIntervalData])
 
   // Early validation before calling the hook
   if (!oracleAddress || !chainIdValid) {
@@ -470,7 +643,6 @@ export default function OracleInteractionPage() {
     )
   }
 
-  const { oracle, loading: oracleLoading, error: oracleError } = useOracle(oracleAddress, chainId)
 
   // Handle transaction success
   useEffect(() => {
@@ -506,6 +678,7 @@ export default function OracleInteractionPage() {
     setIsUpdatingVoteWeights(false)
     setIsReadingValue(false)
     setIsReadingLatestValue(false)
+    setIsReadingInterval(false)
     // Clear form inputs
     setSubmitValue("")
     setDepositAmount("")
@@ -529,6 +702,7 @@ export default function OracleInteractionPage() {
       setIsUpdatingVoteWeights(false)
       setIsReadingValue(false)
       setIsReadingLatestValue(false)
+      setIsReadingInterval(false)
     }
   }, [contractError, toast])
 
@@ -553,14 +727,11 @@ export default function OracleInteractionPage() {
 
     try {
       setIsSubmitting(true)
-      // Convert to int256 - the value should be a scaled integer
-      // For example, if submitting 2500, multiply by 1e8 to get proper precision
-      const valueAsFloat = parseFloat(submitValue)
-      const valueAsInt = BigInt(Math.floor(valueAsFloat * (10**PRICE_DECIMALS)))
+      // Parse to bigint using exact decimals to prevent JS precision loss
+      const valueAsInt = parseUnits(submitValue, PRICE_DECIMALS)
       
       console.log('Submitting value:', {
         original: submitValue,
-        asFloat: valueAsFloat,
         asInt: valueAsInt.toString(),
         oracleAddress: oracleAddress,
         userAddress: userAddress
@@ -885,20 +1056,20 @@ export default function OracleInteractionPage() {
   }
 
   const simulateRead = useCallback(
-    async (fnName: "readValue" | "readLatestValue") => {
+    async (fnName: "readValue" | "readLatestValue" | "readValueInterval") => {
       if (!oracleAddress || !publicClient) {
         throw new Error("Oracle client not ready")
       }
 
       const attempt = async (account?: `0x${string}`) => {
-        const { result } = await publicClient.simulateContract({
+        const result = await publicClient.readContract({
           address: oracleAddress,
-          abi: OracleAbi,
+          abi: (oracle?.isComposed ? ComposedOracleAbi : OracleAbi) as any,
           functionName: fnName,
           args: [],
           account,
         })
-        return result as bigint
+        return result as bigint | readonly [bigint, bigint]
       }
 
       let lastError: unknown
@@ -928,7 +1099,7 @@ export default function OracleInteractionPage() {
         throw new Error("Failed to simulate read call")
       }
     },
-    [oracleAddress, publicClient, userAddress]
+    [oracleAddress, publicClient, userAddress, oracle?.isComposed]
   )
 
   const handleReadValue = async () => {
@@ -936,7 +1107,7 @@ export default function OracleInteractionPage() {
       setIsReadingValue(true)
 
       const { result, usedFallback } = await simulateRead("readValue")
-      const formatted = formatPriceFromWei(result)
+      const formatted = formatPriceFromWei(result as bigint)
 
       setAggregatedValue(formatted)
       setLastUpdated("Just now")
@@ -971,7 +1142,7 @@ export default function OracleInteractionPage() {
       setIsReadingLatestValue(true)
 
       const { result, usedFallback } = await simulateRead("readLatestValue")
-      const formatted = formatPriceFromWei(result)
+      const formatted = formatPriceFromWei(result as bigint)
 
       setLatestValue(formatted)
       setLastUpdated("Just now")
@@ -998,6 +1169,46 @@ export default function OracleInteractionPage() {
       })
     } finally {
       setIsReadingLatestValue(false)
+    }
+  }
+
+  const handleReadValueInterval = async () => {
+    try {
+      setIsReadingInterval(true)
+
+      const { result, usedFallback } = await simulateRead("readValueInterval")
+      if (Array.isArray(result) && result.length === 2) {
+        const [minRaw, maxRaw] = result as [bigint, bigint]
+        const formattedMin = formatPriceFromWei(minRaw)
+        const formattedMax = formatPriceFromWei(maxRaw)
+
+        setMinValue(formattedMin)
+        setMaxValue(formattedMax)
+        setLastUpdated("Just now")
+
+        toast({
+          title: "Lookback Price Interval",
+          description: usedFallback
+            ? `Min: ${formattedMin} | Max: ${formattedMax}. Retrieved via neutral simulation.`
+            : `Min: ${formattedMin} | Max: ${formattedMax}`,
+        })
+      }
+    } catch (err: unknown) {
+      console.error('Error reading price interval:', err)
+      const description =
+        err instanceof BaseError
+          ? err.shortMessage
+          : err instanceof Error
+            ? err.message
+            : "Failed to read price interval. Please try again."
+
+      toast({
+        title: "Read Failed",
+        description,
+        variant: "destructive",
+      })
+    } finally {
+      setIsReadingInterval(false)
     }
   }
 
@@ -1124,40 +1335,94 @@ export default function OracleInteractionPage() {
             </CardContent>
           </Card>
 
-          {/* Submit Value Section */}
+          {/* Submit Value or Formula Section */}
           <div className="grid md:grid-cols-2 gap-6">
-            <Card className="border-border/50 bg-card/30 backdrop-blur-sm hover:bg-card/60 border-primary/20 hover:border-white transition-all duration-300 rounded-2xl">
-              <CardHeader className="border-b border-border/30">
-                <CardTitle className="text-foreground flex items-center gap-2 font-medium">
-                  <Send className="h-5 w-5 text-primary" />
-                Submit Price Value
-              </CardTitle>
-                <CardDescription className="text-muted-foreground">
-                Submit a new price value to the oracle. You must have deposited tokens to participate.
-              </CardDescription>
-            </CardHeader>
-              <CardContent>
-                <div className="mb-4">
-                  <Label htmlFor="submitValue" className="text-foreground font-medium mb-2">Price Value</Label>
-                <Input
-                  id="submitValue"
-                  type="number"
-                  placeholder="Enter price value (e.g., 2500)"
-                  value={submitValue}
-                  onChange={(e) => setSubmitValue(e.target.value)}
-                    className="h-12 bg-card/50 border border-primary/30 rounded-xl font-light transition-all duration-300 focus:border-primary/50 focus:ring-2 focus:ring-primary/20 focus:bg-card/70"
-                />
-              </div>
-              <Button 
-                onClick={handleSubmitValue} 
-                disabled={isSubmitting || isPending || isConfirming || !submitValue || !isConnected}
-                className="w-full bg-primary hover:bg-primary/90 text-primary-foreground border-primary/50 h-12 rounded-xl transition-all duration-300"
-              >
-                {(isSubmitting || isPending || isConfirming) ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Send className="h-4 w-4 mr-2" />}
-                {isSubmitting || isPending ? "Submitting..." : isConfirming ? "Confirming..." : "Submit Value"}
-              </Button>
-            </CardContent>
-          </Card>
+            {oracle?.isComposed ? (
+              <Card className="border-border/50 bg-card/30 backdrop-blur-sm hover:bg-card/60 border-primary/20 hover:border-white transition-all duration-300 rounded-2xl">
+                <CardHeader className="border-b border-border/30">
+                  <CardTitle className="text-foreground flex items-center gap-2 font-medium">
+                    <Settings className="h-5 w-5 text-primary" />
+                    Composition Formula
+                  </CardTitle>
+                  <CardDescription className="text-muted-foreground">
+                    This derivative price index is computed mathematically on-chain from two separate feeds.
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                  <div className="flex flex-col gap-1.5 p-3 bg-card/50 border border-primary/30 rounded-xl">
+                    <span className="text-[10px] font-mono text-muted-foreground uppercase tracking-widest">Formula Definition</span>
+                    <div className="text-base font-light text-foreground flex items-center gap-2">
+                      <Link
+                        href={`/o?chainId=${chainId}&oracle=${oracle.feedA}`}
+                        className="text-primary hover:underline font-mono"
+                      >
+                        {oracle.name?.split(' ')[0] || (oracle.feedA ? `${oracle.feedA.slice(0, 6)}...${oracle.feedA.slice(-4)}` : "")}
+                      </Link>
+                      <span className="font-bold text-primary font-mono">{oracle.operation === 0 ? "×" : "/"}</span>
+                      <Link
+                        href={`/o?chainId=${chainId}&oracle=${oracle.feedB}`}
+                        className="text-primary hover:underline font-mono"
+                      >
+                        {oracle.name?.split(' ')[2] || (oracle.feedB ? `${oracle.feedB.slice(0, 6)}...${oracle.feedB.slice(-4)}` : "")}
+                      </Link>
+                      {oracle.invertResult && (
+                        <span className="text-[9px] font-mono bg-primary/10 text-primary px-2 py-0.5 rounded border border-primary/20 ml-2 uppercase tracking-wider">
+                          Inverted
+                        </span>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-4 text-xs">
+                    <div className="p-3 bg-card/30 border border-primary/25 rounded-xl">
+                      <span className="text-[9px] font-mono text-muted-foreground uppercase block mb-1">Index Deployer</span>
+                      <span className="font-mono text-xs text-foreground block truncate" title={oracle.creator}>
+                        {oracle.creator ? `${oracle.creator.slice(0, 6)}...${oracle.creator.slice(-4)}` : "—"}
+                      </span>
+                    </div>
+                    <div className="p-3 bg-card/30 border border-primary/25 rounded-xl">
+                      <span className="text-[9px] font-mono text-muted-foreground uppercase block mb-1">Lookback Points</span>
+                      <span className="font-mono text-xs text-foreground block">
+                        {oracle.defaultSampleSize ? oracle.defaultSampleSize.toString() : "100"}
+                      </span>
+                    </div>
+                  </div>
+                </CardContent>
+              </Card>
+            ) : (
+              <Card className="border-border/50 bg-card/30 backdrop-blur-sm hover:bg-card/60 border-primary/20 hover:border-white transition-all duration-300 rounded-2xl">
+                <CardHeader className="border-b border-border/30">
+                  <CardTitle className="text-foreground flex items-center gap-2 font-medium">
+                    <Send className="h-5 w-5 text-primary" />
+                    Submit Price Value
+                  </CardTitle>
+                  <CardDescription className="text-muted-foreground">
+                    Submit a new price value to the oracle. You must have deposited tokens to participate.
+                  </CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <div className="mb-4">
+                    <Label htmlFor="submitValue" className="text-foreground font-medium mb-2">Price Value</Label>
+                    <Input
+                      id="submitValue"
+                      type="number"
+                      placeholder="Enter price value (e.g., 2500)"
+                      value={submitValue}
+                      onChange={(e) => setSubmitValue(e.target.value)}
+                      className="h-12 bg-card/50 border border-primary/30 rounded-xl font-light transition-all duration-300 focus:border-primary/50 focus:ring-2 focus:ring-primary/20 focus:bg-card/70"
+                    />
+                  </div>
+                  <Button 
+                    onClick={handleSubmitValue} 
+                    disabled={isSubmitting || isPending || isConfirming || !submitValue || !isConnected}
+                    className="w-full bg-primary hover:bg-primary/90 text-primary-foreground border-primary/50 h-12 rounded-xl transition-all duration-300"
+                  >
+                    {(isSubmitting || isPending || isConfirming) ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Send className="h-4 w-4 mr-2" />}
+                    {isSubmitting || isPending ? "Submitting..." : isConfirming ? "Confirming..." : "Submit Value"}
+                  </Button>
+                </CardContent>
+              </Card>
+            )}
 
             <Card className="border-border/50 bg-card/30 backdrop-blur-sm hover:bg-card/60 border-primary/20 hover:border-white transition-all duration-300 rounded-2xl">
               <CardHeader className="border-b border-border/30">
@@ -1172,14 +1437,13 @@ export default function OracleInteractionPage() {
                   </div>
                 </div>
                 <CardDescription className="text-muted-foreground">
-                  Latest submitted and aggregated oracle values.
+                  Latest submitted, aggregated, and lookback interval oracle values.
                 </CardDescription>
               </CardHeader>
               <CardContent>
-                <div>
-                  <div className="flex items-center mb-4 justify-between p-3 bg-card/50 border border-primary/30 rounded-xl transition-all duration-300">
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between p-3 bg-card/50 border border-primary/30 rounded-xl transition-all duration-300">
                     <div className="flex items-center gap-3">
-                      <div className="w-2 h-2 bg-primary rounded-full animate-pulse"></div>
                       <span className="text-muted-foreground font-medium text-sm">Latest Value</span>
                       <span className="text-foreground font-light">{latestValue || "—"}</span>
                     </div>
@@ -1196,7 +1460,6 @@ export default function OracleInteractionPage() {
                   
                   <div className="flex items-center justify-between p-3 bg-card/50 border border-primary/30 rounded-xl transition-all duration-300">
                     <div className="flex items-center gap-3">
-                      <div className="w-2 h-2 bg-primary/60 rounded-full"></div>
                       <span className="text-muted-foreground font-medium text-sm">Aggregated</span>
                       <span className="text-foreground font-light">{aggregatedValue || "—"}</span>
                     </div>
@@ -1210,222 +1473,246 @@ export default function OracleInteractionPage() {
                       {isReadingValue || isPending || isConfirming ? <Loader2 className="h-3 w-3 animate-spin" /> : "Read"}
                     </Button>
                   </div>
+
+                  {/* Price Interval */}
+                  <div className="flex items-center justify-between p-3 bg-card/50 border border-primary/30 rounded-xl transition-all duration-300">
+                    <div className="flex items-center gap-3">
+                      <span className="text-muted-foreground font-medium text-sm">Price Interval</span>
+                      <span className="text-foreground font-light">
+                        {minValue !== "—" && maxValue !== "—"
+                          ? `${minValue}(Min) - ${maxValue}(Max)`
+                          : "—"}
+                      </span>
+                    </div>
+                    <Button 
+                      size="sm"
+                      variant="outline"
+                      className="h-8 px-3 text-xs border-primary/30 text-primary hover:bg-primary/10 hover:border-primary/50 transition-all duration-300"
+                      onClick={handleReadValueInterval}
+                      disabled={isReadingInterval || isPending || isConfirming || !isConnected}
+                    >
+                      {isReadingInterval || isPending || isConfirming ? <Loader2 className="h-3 w-3 animate-spin" /> : "Read"}
+                    </Button>
+                  </div>
                 </div>
               </CardContent>
             </Card>
           </div>
 
           {/* Token Management Section */}
-          <div className="grid md:grid-cols-2 gap-6">
-            <Card className="border-border/50 bg-card/30 backdrop-blur-sm hover:bg-card/60 border-primary/20 hover:border-white transition-all duration-300 rounded-2xl">
-              <CardHeader className="border-b border-border/30">
-                <CardTitle className="text-foreground flex items-center gap-2 font-medium">
-                  <Wallet className="h-5 w-5 text-primary" />
-                  Deposit Tokens
-                </CardTitle>
-                <CardDescription className="text-muted-foreground">
-                  Deposit weight tokens to participate in oracle governance and earn rewards.
-                </CardDescription>
-              </CardHeader>
-              <CardContent>
-                {/* Token Balance Display */}
-                {isConnected && (
-                  <div className="space-y-3 mb-4">
-                    
-                    {/* Detailed Token State Breakdown */}
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 p-2 bg-card/30 border border-primary/20 rounded-lg text-xs">
-                  <div className="text-center">
-                    <div className="text-muted-foreground/80 mb-0.5">🔒 Locked</div>
-                    <div className="text-foreground/90 font-light">
-                      {formatTokenAmount(lockedTokensData ? (lockedTokensData as bigint) : undefined)} {weightTokenSymbol}
+          {!oracle?.isComposed && (
+            <div className="grid md:grid-cols-2 gap-6">
+              <Card className="border-border/50 bg-card/30 backdrop-blur-sm hover:bg-card/60 border-primary/20 hover:border-white transition-all duration-300 rounded-2xl">
+                <CardHeader className="border-b border-border/30">
+                  <CardTitle className="text-foreground flex items-center gap-2 font-medium">
+                    <Wallet className="h-5 w-5 text-primary" />
+                    Deposit Tokens
+                  </CardTitle>
+                  <CardDescription className="text-muted-foreground">
+                    Deposit weight tokens to participate in oracle governance and earn rewards.
+                  </CardDescription>
+                </CardHeader>
+                <CardContent>
+                  {/* Token Balance Display */}
+                  {isConnected && (
+                    <div className="space-y-3 mb-4">
+                      
+                      {/* Detailed Token State Breakdown */}
+                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 p-2 bg-card/30 border border-primary/20 rounded-lg text-xs">
+                        <div className="text-center">
+                          <div className="text-muted-foreground/80 mb-0.5">🔒 Locked</div>
+                          <div className="text-foreground/90 font-light">
+                            {formatTokenAmount(lockedTokensData ? (lockedTokensData as bigint) : undefined)} {weightTokenSymbol}
+                          </div>
+                        </div>
+                        <div className="text-center">
+                          <div className="text-muted-foreground/80 mb-0.5">📅 Deposit Time</div>
+                          <div className="text-foreground/90 font-light text-xs">{depositTimestamp}</div>
+                        </div>
+                        <div className="text-center">
+                          <div className="text-muted-foreground/80 mb-0.5">💼 Wallet Balance</div>
+                          <div className="text-foreground/90 font-light">
+                            {walletTokenBalanceDisplay} {weightTokenSymbol}
+                          </div>
+                        </div>
+                      </div>
                     </div>
+                  )}
+                  
+                  <div className="space-y-2">
+                    <Label htmlFor="depositAmount" className="text-foreground font-medium">Amount</Label>
+                    <Input
+                      id="depositAmount"
+                      type="number"
+                      placeholder="Enter amount to deposit"
+                      value={depositAmount}
+                      onChange={(e) => setDepositAmount(e.target.value)}
+                      className="h-12 mb-4 bg-card/50 border border-primary/30 rounded-xl font-light transition-all duration-300 focus:border-primary/50 focus:ring-2 focus:ring-primary/20 focus:bg-card/70"
+                    />
                   </div>
-                  <div className="text-center">
-                    <div className="text-muted-foreground/80 mb-0.5">📅 Deposit Time</div>
-                    <div className="text-foreground/90 font-light text-xs">{depositTimestamp}</div>
-                  </div>
-                  <div className="text-center">
-                    <div className="text-muted-foreground/80 mb-0.5">💼 Wallet Balance</div>
-                    <div className="text-foreground/90 font-light">
-                      {walletTokenBalanceDisplay} {weightTokenSymbol}
+                  
+                  {/* Conditional Buttons based on allowance */}
+                  {(() => {
+                    const amount = depositAmount ? parseUnits(depositAmount, weightTokenDecimals) : BigInt(0)
+                    const allowance = tokenAllowanceData ? BigInt(tokenAllowanceData as bigint) : BigInt(0)
+                    const needsApproval = amount > allowance
+
+                    if (needsApproval) {
+                      return (
+                        <Button 
+                          onClick={handleApproveTokens} 
+                          disabled={isApproving || isPending || isConfirming || !depositAmount || !isConnected}
+                          className="w-full bg-primary hover:bg-primary/90 text-primary-foreground border-primary/50 h-12 rounded-xl transition-all duration-300"
+                        >
+                          {(isApproving || isPending || isConfirming) ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <CheckCircle className="h-4 w-4 mr-2" />}
+                          {isApproving || isPending ? "Approving..." : isConfirming ? "Confirming..." : "Approve Tokens"}
+                        </Button>
+                      )
+                    } else {
+                      return (
+                        <Button 
+                          onClick={handleDepositTokens} 
+                          disabled={isDepositing || isPending || isConfirming || !depositAmount || !isConnected}
+                          className="w-full bg-primary hover:bg-primary/90 text-primary-foreground h-12 rounded-xl transition-all duration-300"
+                        >
+                          {(isDepositing || isPending || isConfirming) ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Wallet className="h-4 w-4 mr-2" />}
+                          {isDepositing || isPending ? "Depositing..." : isConfirming ? "Confirming..." : "Deposit Tokens"}
+                        </Button>
+                      )
+                    }
+                  })()}
+                </CardContent>
+              </Card>
+
+              <Card className="border-border/50 bg-card/30 backdrop-blur-sm hover:bg-card/60 border-primary/20 hover:border-white transition-all duration-300 rounded-2xl">
+                <CardHeader className="border-b border-border/30">
+                  <CardTitle className="text-foreground flex items-center gap-2 font-medium">
+                    <Wallet className="h-5 w-5 text-destructive" />
+                    Withdraw Tokens
+                  </CardTitle>
+                  <CardDescription className="text-muted-foreground">
+                    Withdraw your deposited tokens. Note the withdrawal locking period.
+                  </CardDescription>
+                </CardHeader>
+                <CardContent>
+                  {/* Show deposited tokens */}
+                  {isConnected && (
+                    <div className="grid grid-cols-2 gap-2 p-2 bg-card/30 border border-primary/20 rounded-lg text-xs mb-4">
+                      <div className="text-center">
+                        <div className="text-muted-foreground/80 mb-0.5">⏰ Last Operation</div>
+                        <div className="text-foreground/90 font-light text-xs">{lastOperationTimestamp}</div>
+                      </div>
+                      <div className="text-center">
+                        <div className="text-muted-foreground/80 mb-0.5">✓ Unlocked</div>
+                        <div className="text-foreground/90 font-light">
+                          {formatTokenAmount(unlockedTokensData ? (unlockedTokensData as bigint) : undefined)} {weightTokenSymbol}
+                        </div>
+                      </div>
                     </div>
+                  )}
+                  
+                  <div className="space-y-2">
+                    <Label htmlFor="withdrawAmount" className="text-foreground font-medium">Amount</Label>
+                    <Input
+                      id="withdrawAmount"
+                      type="number"
+                      placeholder="Enter amount to withdraw"
+                      value={withdrawAmount}
+                      onChange={(e) => setWithdrawAmount(e.target.value)}
+                      className="h-12 mb-4 bg-card/50 border border-primary/30 rounded-xl font-light transition-all duration-300 focus:border-primary/50 focus:ring-2 focus:ring-primary/20 focus:bg-card/70"
+                    />
                   </div>
-                </div>
-              </div>
-                )}
-                
-                <div className="space-y-2">
-                  <Label htmlFor="depositAmount" className="text-foreground font-medium">Amount</Label>
-                  <Input
-                    id="depositAmount"
-                    type="number"
-                    placeholder="Enter amount to deposit"
-                    value={depositAmount}
-                    onChange={(e) => setDepositAmount(e.target.value)}
-                    className="h-12 mb-4 bg-card/50 border border-primary/30 rounded-xl font-light transition-all duration-300 focus:border-primary/50 focus:ring-2 focus:ring-primary/20 focus:bg-card/70"
-                  />
-                </div>
-                
-                {/* Conditional Buttons based on allowance */}
-                {(() => {
-                  const amount = depositAmount ? parseUnits(depositAmount, weightTokenDecimals) : BigInt(0)
-                  const allowance = tokenAllowanceData ? BigInt(tokenAllowanceData as bigint) : BigInt(0)
-                  const needsApproval = amount > allowance
-
-                  if (needsApproval) {
-                    return (
-                      <Button 
-                        onClick={handleApproveTokens} 
-                        disabled={isApproving || isPending || isConfirming || !depositAmount || !isConnected}
-                  className="w-full bg-primary hover:bg-primary/90 text-primary-foreground border-primary/50 h-12 rounded-xl transition-all duration-300"
-
-                      >
-                        {(isApproving || isPending || isConfirming) ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <CheckCircle className="h-4 w-4 mr-2" />}
-                        {isApproving || isPending ? "Approving..." : isConfirming ? "Confirming..." : "Approve Tokens"}
-                      </Button>
-                    )
-                  } else {
-                    return (
-                <Button 
-                  onClick={handleDepositTokens} 
-                        disabled={isDepositing || isPending || isConfirming || !depositAmount || !isConnected}
-                        className="w-full bg-primary hover:bg-primary/90 text-primary-foreground h-12 rounded-xl transition-all duration-300"
-                >
-                        {(isDepositing || isPending || isConfirming) ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Wallet className="h-4 w-4 mr-2" />}
-                        {isDepositing || isPending ? "Depositing..." : isConfirming ? "Confirming..." : "Deposit Tokens"}
-                </Button>
-                    )
-                  }
-                })()}
-              </CardContent>
-            </Card>
-
-            <Card className="border-border/50 bg-card/30 backdrop-blur-sm hover:bg-card/60 border-primary/20 hover:border-white transition-all duration-300 rounded-2xl">
-              <CardHeader className="border-b border-border/30">
-                <CardTitle className="text-foreground flex items-center gap-2 font-medium">
-                  <Wallet className="h-5 w-5 text-destructive" />
-                  Withdraw Tokens
-                </CardTitle>
-                <CardDescription className="text-muted-foreground">
-                  Withdraw your deposited tokens. Note the withdrawal locking period.
-                </CardDescription>
-              </CardHeader>
-              <CardContent>
-                {/* Show deposited tokens */}
-                {isConnected && (
-                  <div className="grid grid-cols-2 gap-2 p-2 bg-card/30 border border-primary/20 rounded-lg text-xs mb-4">
-                  <div className="text-center">
-                    <div className="text-muted-foreground/80 mb-0.5">⏰ Last Operation</div>
-                    <div className="text-foreground/90 font-light text-xs">{lastOperationTimestamp}</div>
-                  </div>
-                  <div className="text-center">
-                    <div className="text-muted-foreground/80 mb-0.5">✓ Unlocked</div>
-                    <div className="text-foreground/90 font-light">
-                      {formatTokenAmount(unlockedTokensData ? (unlockedTokensData as bigint) : undefined)} {weightTokenSymbol}
-                    </div>
-                  </div>
-                </div>
-                )}
-                
-                <div className="space-y-2">
-                  <Label htmlFor="withdrawAmount" className="text-foreground font-medium">Amount</Label>
-                  <Input
-                    id="withdrawAmount"
-                    type="number"
-                    placeholder="Enter amount to withdraw"
-                    value={withdrawAmount}
-                    onChange={(e) => setWithdrawAmount(e.target.value)}
-                    className="h-12 mb-4 bg-card/50 border border-primary/30 rounded-xl font-light transition-all duration-300 focus:border-primary/50 focus:ring-2 focus:ring-primary/20 focus:bg-card/70"
-                  />
-                </div>
-                <Button 
-                  onClick={handleWithdrawTokens} 
-                  disabled={isWithdrawing || isPending || isConfirming || !withdrawAmount || !isConnected}
-                  className="w-full bg-destructive hover:bg-destructive/90 text-destructive-foreground h-12 rounded-xl transition-all duration-300"
-                >
-                  {(isWithdrawing || isPending || isConfirming) ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Wallet className="h-4 w-4 mr-2" />}
-                  {isWithdrawing || isPending ? "Withdrawing..." : isConfirming ? "Confirming..." : "Withdraw Tokens"}
-                </Button>
-              </CardContent>
-            </Card>
-          </div>
+                  <Button 
+                    onClick={handleWithdrawTokens} 
+                    disabled={isWithdrawing || isPending || isConfirming || !withdrawAmount || !isConnected}
+                    className="w-full bg-destructive hover:bg-destructive/90 text-destructive-foreground h-12 rounded-xl transition-all duration-300"
+                  >
+                    {(isWithdrawing || isPending || isConfirming) ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Wallet className="h-4 w-4 mr-2" />}
+                    {isWithdrawing || isPending ? "Withdrawing..." : isConfirming ? "Confirming..." : "Withdraw Tokens"}
+                  </Button>
+                </CardContent>
+              </Card>
+            </div>
+          )}
 
           {/* Governance Section */}
-          <div className="grid md:grid-cols-2 gap-6">
-            <Card className="border-border/50 bg-card/30 backdrop-blur-sm hover:bg-card/60 border-primary/20 hover:border-white transition-all duration-300 rounded-2xl">
-              <CardHeader className="border-b border-border/30">
-                <CardTitle className="text-foreground flex items-center gap-2 font-medium">
-                  <Vote className="h-5 w-5 text-primary" />
-                  Governance Voting
-                </CardTitle>
-                <CardDescription className="text-muted-foreground">
-                  Vote to blacklist or whitelist addresses. Your voting power is based on your deposited tokens.
-                </CardDescription>
-              </CardHeader>
-              <CardContent>
-                <div className="space-y-2">
-                  <Label htmlFor="voteTarget" className="text-foreground font-medium">Target Address</Label>
-                  <Input
-                    id="voteTarget"
-                    placeholder="0x..."
-                    value={voteTarget}
-                    onChange={(e) => setVoteTarget(e.target.value)}
-                    className="h-12 mb-4 bg-card/50 border border-primary/30 rounded-xl font-light transition-all duration-300 focus:border-primary/50 focus:ring-2 focus:ring-primary/20 focus:bg-card/70"
-                  />
-                </div>
-                <div className="grid grid-cols-2 gap-4">
-                  <Button 
-                    onClick={handleVoteBlacklist} 
-                    disabled={isVoting || isPending || isConfirming || !voteTarget || !isConnected}
-                    className="bg-destructive hover:bg-destructive/90 text-destructive-foreground h-12 rounded-xl transition-all duration-300"
-                  >
-                    {(isVoting || isPending || isConfirming) ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Shield className="h-4 w-4 mr-2" />}
-                    {isVoting || isPending ? "Voting..." : isConfirming ? "Confirming..." : "Vote Blacklist"}
-                  </Button>
-                  <Button 
-                    onClick={handleVoteWhitelist} 
-                    disabled={isVoting || isPending || isConfirming || !voteTarget || !isConnected}
-                    className="bg-primary hover:bg-primary/90 text-primary-foreground h-12 rounded-xl transition-all duration-300"
-                  >
-                    {(isVoting || isPending || isConfirming) ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Shield className="h-4 w-4 mr-2" />}
-                    {isVoting || isPending ? "Voting..." : isConfirming ? "Confirming..." : "Vote Whitelist"}
-                  </Button>
-                </div>
-              </CardContent>
-            </Card>
-
-            <Card className="border-border/50 bg-card/30 backdrop-blur-sm hover:bg-card/60 border-primary/20 hover:border-white transition-all duration-300 rounded-2xl">
-              <CardHeader className="border-b border-border/30">
-                <CardTitle className="text-foreground flex items-center gap-2 font-medium" >
-                  <Settings className="h-5 w-5 text-primary" />
-                  Update Vote Weights
-                </CardTitle>
-                <CardDescription className="text-muted-foreground">
-                  Update your vote weights to reflect your current token balance. Required after depositing new tokens.
-                </CardDescription>
-              </CardHeader>
-              <CardContent>
-                {/* Current voting power display */}
-                {isConnected && (
-                  <div className="p-3 bg-card/50 border border-primary/30 rounded-xl mb-4">
-                    <div className="flex items-center justify-between">
-                      <div className="text-sm text-muted-foreground">Current Voting Power</div>
-                      <div className="text-lg font-light text-primary font-medium">{parseFloat(userDepositedTokens).toFixed(4)}</div>
-                    </div>
+          {!oracle?.isComposed && (
+            <div className="grid md:grid-cols-2 gap-6">
+              <Card className="border-border/50 bg-card/30 backdrop-blur-sm hover:bg-card/60 border-primary/20 hover:border-white transition-all duration-300 rounded-2xl">
+                <CardHeader className="border-b border-border/30">
+                  <CardTitle className="text-foreground flex items-center gap-2 font-medium">
+                    <Vote className="h-5 w-5 text-primary" />
+                    Governance Voting
+                  </CardTitle>
+                  <CardDescription className="text-muted-foreground">
+                    Vote to blacklist or whitelist addresses. Your voting power is based on your deposited tokens.
+                  </CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <div className="space-y-2">
+                    <Label htmlFor="voteTarget" className="text-foreground font-medium">Target Address</Label>
+                    <Input
+                      id="voteTarget"
+                      placeholder="0x..."
+                      value={voteTarget}
+                      onChange={(e) => setVoteTarget(e.target.value)}
+                      className="h-12 mb-4 bg-card/50 border border-primary/30 rounded-xl font-light transition-all duration-300 focus:border-primary/50 focus:ring-2 focus:ring-primary/20 focus:bg-card/70"
+                    />
                   </div>
-                )}
-                
-                <Button 
-                  onClick={handleUpdateVoteWeights} 
-                  disabled={isUpdatingVoteWeights || isPending || isConfirming || !isConnected}
-                  className="w-full bg-primary hover:bg-primary/90 text-primary-foreground border-primary/50 h-12 rounded-xl transition-all duration-300"
-                >
-                  {(isUpdatingVoteWeights || isPending || isConfirming) ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Settings className="h-4 w-4 mr-2" />}
-                  {isUpdatingVoteWeights || isPending ? "Updating..." : isConfirming ? "Confirming..." : "Update Vote Weights"}
-                </Button>
-              </CardContent>
-            </Card>
-          </div>
+                  <div className="grid grid-cols-2 gap-4">
+                    <Button 
+                      onClick={handleVoteBlacklist} 
+                      disabled={isVoting || isPending || isConfirming || !voteTarget || !isConnected}
+                      className="bg-destructive hover:bg-destructive/90 text-destructive-foreground h-12 rounded-xl transition-all duration-300"
+                    >
+                      {(isVoting || isPending || isConfirming) ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Shield className="h-4 w-4 mr-2" />}
+                      {isVoting || isPending ? "Voting..." : isConfirming ? "Confirming..." : "Vote Blacklist"}
+                    </Button>
+                    <Button 
+                      onClick={handleVoteWhitelist} 
+                      disabled={isVoting || isPending || isConfirming || !voteTarget || !isConnected}
+                      className="bg-primary hover:bg-primary/90 text-primary-foreground h-12 rounded-xl transition-all duration-300"
+                    >
+                      {(isVoting || isPending || isConfirming) ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Shield className="h-4 w-4 mr-2" />}
+                      {isVoting || isPending ? "Voting..." : isConfirming ? "Confirming..." : "Vote Whitelist"}
+                    </Button>
+                  </div>
+                </CardContent>
+              </Card>
+
+              <Card className="border-border/50 bg-card/30 backdrop-blur-sm hover:bg-card/60 border-primary/20 hover:border-white transition-all duration-300 rounded-2xl">
+                <CardHeader className="border-b border-border/30">
+                  <CardTitle className="text-foreground flex items-center gap-2 font-medium" >
+                    <Settings className="h-5 w-5 text-primary" />
+                    Update Vote Weights
+                  </CardTitle>
+                  <CardDescription className="text-muted-foreground">
+                    Update your vote weights to reflect your current token balance. Required after depositing new tokens.
+                  </CardDescription>
+                </CardHeader>
+                <CardContent>
+                  {/* Current voting power display */}
+                  {isConnected && (
+                    <div className="p-3 bg-card/50 border border-primary/30 rounded-xl mb-4">
+                      <div className="flex items-center justify-between">
+                        <div className="text-sm text-muted-foreground">Current Voting Power</div>
+                        <div className="text-lg font-light text-primary font-medium">{parseFloat(userDepositedTokens).toFixed(4)}</div>
+                      </div>
+                    </div>
+                  )}
+                  
+                  <Button 
+                    onClick={handleUpdateVoteWeights} 
+                    disabled={isUpdatingVoteWeights || isPending || isConfirming || !isConnected}
+                    className="w-full bg-primary hover:bg-primary/90 text-primary-foreground border-primary/50 h-12 rounded-xl transition-all duration-300"
+                  >
+                    {(isUpdatingVoteWeights || isPending || isConfirming) ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Settings className="h-4 w-4 mr-2" />}
+                    {isUpdatingVoteWeights || isPending ? "Updating..." : isConfirming ? "Confirming..." : "Update Vote Weights"}
+                  </Button>
+                </CardContent>
+              </Card>
+            </div>
+          )}
 
           {/* Oracle Configuration */}
           <Card className="border-border/50 bg-card/30 backdrop-blur-sm hover:bg-card/60 border-primary/20 hover:border-white transition-all duration-300 rounded-2xl">
@@ -1439,36 +1726,75 @@ export default function OracleInteractionPage() {
               </CardDescription>
             </CardHeader>
             <CardContent className="p-6">
-              <div className="grid md:grid-cols-2 gap-6">
-                <div className="space-y-4">
-                  <div className="flex justify-between items-center p-3 bg-card/50 border border-primary/30 rounded-xl transition-all duration-300">
-                    <span className="text-muted-foreground font-medium">Reward Rate</span>
-                    <span className="text-foreground font-light">{rewardRate}</span>
+              {oracle?.isComposed ? (
+                <div className="grid md:grid-cols-2 gap-6">
+                  <div className="space-y-4">
+                    <div className="flex justify-between items-center p-3 bg-card/50 border border-primary/30 rounded-xl transition-all duration-300">
+                      <span className="text-muted-foreground font-medium">Parent Feed A</span>
+                      <Link href={`/o?chainId=${chainId}&oracle=${oracle.feedA}`} className="text-primary hover:underline font-mono text-sm">
+                        {oracle.name?.split(' ')[0] || (oracle.feedA ? `${oracle.feedA.slice(0, 6)}...${oracle.feedA.slice(-4)}` : "—")}
+                      </Link>
+                    </div>
+                    <div className="flex justify-between items-center p-3 bg-card/50 border border-primary/30 rounded-xl transition-all duration-300">
+                      <span className="text-muted-foreground font-medium">Parent Feed B</span>
+                      <Link href={`/o?chainId=${chainId}&oracle=${oracle.feedB}`} className="text-primary hover:underline font-mono text-sm">
+                        {oracle.name?.split(' ')[2] || (oracle.feedB ? `${oracle.feedB.slice(0, 6)}...${oracle.feedB.slice(-4)}` : "—")}
+                      </Link>
+                    </div>
+                    <div className="flex justify-between items-center p-3 bg-card/50 border border-primary/30 rounded-xl transition-all duration-300">
+                      <span className="text-muted-foreground font-medium">Operation</span>
+                      <span className="text-foreground font-light font-mono">{oracle.operation === 0 ? "Multiplication (×)" : "Division (/)"}</span>
+                    </div>
                   </div>
-                  <div className="flex justify-between items-center p-3 bg-card/50 border border-primary/30 rounded-xl transition-all duration-300">
-                    <span className="text-muted-foreground font-medium">Half Life</span>
-                    <span className="text-foreground font-light">{halfLifeSeconds}</span>
-                  </div>
-                  <div className="flex justify-between items-center p-3 bg-card/50 border border-primary/30 rounded-xl transition-all duration-300">
-                    <span className="text-muted-foreground font-medium">Quorum</span>
-                    <span className="text-foreground font-light">{quorumPercentage}</span>
+                  <div className="space-y-4">
+                    <div className="flex justify-between items-center p-3 bg-card/50 border border-primary/30 rounded-xl transition-all duration-300">
+                      <span className="text-muted-foreground font-medium">Invert Result</span>
+                      <span className="text-foreground font-light">{oracle.invertResult ? "Yes" : "No"}</span>
+                    </div>
+                    <div className="flex justify-between items-center p-3 bg-card/50 border border-primary/30 rounded-xl transition-all duration-300">
+                      <span className="text-muted-foreground font-medium">Default Sample Size</span>
+                      <span className="text-foreground font-light">{oracle.defaultSampleSize ? oracle.defaultSampleSize.toString() : "100"}</span>
+                    </div>
+                    <div className="flex justify-between items-center p-3 bg-card/50 border border-primary/30 rounded-xl transition-all duration-300">
+                      <span className="text-muted-foreground font-medium">Deployer</span>
+                      <span className="text-foreground font-light font-mono text-sm truncate max-w-[200px]" title={oracle.creator}>
+                        {oracle.creator ? `${oracle.creator.slice(0, 6)}...${oracle.creator.slice(-4)}` : "—"}
+                      </span>
+                    </div>
                   </div>
                 </div>
-                <div className="space-y-4">
-                  <div className="flex justify-between items-center p-3 bg-card/50 border border-primary/30 rounded-xl transition-all duration-300">
-                    <span className="text-muted-foreground font-medium">Operation Locking Period</span>
-                    <span className="text-foreground font-light">{operationLockPeriod}</span>
+              ) : (
+                <div className="grid md:grid-cols-2 gap-6">
+                  <div className="space-y-4">
+                    <div className="flex justify-between items-center p-3 bg-card/50 border border-primary/30 rounded-xl transition-all duration-300">
+                      <span className="text-muted-foreground font-medium">Reward Rate</span>
+                      <span className="text-foreground font-light">{rewardRate}</span>
+                    </div>
+                    <div className="flex justify-between items-center p-3 bg-card/50 border border-primary/30 rounded-xl transition-all duration-300">
+                      <span className="text-muted-foreground font-medium">Half Life</span>
+                      <span className="text-foreground font-light">{halfLifeSeconds}</span>
+                    </div>
+                    <div className="flex justify-between items-center p-3 bg-card/50 border border-primary/30 rounded-xl transition-all duration-300">
+                      <span className="text-muted-foreground font-medium">Quorum</span>
+                      <span className="text-foreground font-light">{quorumPercentage}</span>
+                    </div>
                   </div>
-                  <div className="flex justify-between items-center p-3 bg-card/50 border border-primary/30 rounded-xl transition-all duration-300">
-                    <span className="text-muted-foreground font-medium">Withdrawal Locking Period</span>
-                    <span className="text-foreground font-light">{withdrawalLockPeriod}</span>
-                  </div>
-                  <div className="flex justify-between items-center p-3 bg-card/50 border border-primary/30 rounded-xl transition-all duration-300">
-                    <span className="text-muted-foreground font-medium">Alpha</span>
-                    <span className="text-foreground font-light">{alphaValue}</span>
+                  <div className="space-y-4">
+                    <div className="flex justify-between items-center p-3 bg-card/50 border border-primary/30 rounded-xl transition-all duration-300">
+                      <span className="text-muted-foreground font-medium">Operation Locking Period</span>
+                      <span className="text-foreground font-light">{operationLockPeriod}</span>
+                    </div>
+                    <div className="flex justify-between items-center p-3 bg-card/50 border border-primary/30 rounded-xl transition-all duration-300">
+                      <span className="text-muted-foreground font-medium">Withdrawal Locking Period</span>
+                      <span className="text-foreground font-light">{withdrawalLockPeriod}</span>
+                    </div>
+                    <div className="flex justify-between items-center p-3 bg-card/50 border border-primary/30 rounded-xl transition-all duration-300">
+                      <span className="text-muted-foreground font-medium">Alpha</span>
+                      <span className="text-foreground font-light">{alphaValue}</span>
+                    </div>
                   </div>
                 </div>
-              </div>
+              )}
             </CardContent>
           </Card>
 
